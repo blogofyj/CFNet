@@ -1,0 +1,180 @@
+import torch, sys, os
+import torch.nn as nn
+sys.path.append(os.pardir)
+# import sys
+# sys.path.append("..")
+import torch.nn.functional as F
+from torch.nn import init
+import functools
+from purifier_vae.deconv import FastDeconv
+from purifier_vae.DCNv2.dcn_v2 import DCN
+
+
+
+def default_conv(in_channels, out_channels, kernel_size, bias=True):
+    return nn.Conv2d(in_channels, out_channels, kernel_size, padding=(kernel_size // 2), bias=bias)
+
+
+class PALayer(nn.Module):
+    def __init__(self, channel):
+        super(PALayer, self).__init__()
+        self.pa = nn.Sequential(
+            nn.Conv2d(channel, channel // 8, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // 8, 1, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.pa(x)
+        return x * y
+
+
+class CALayer(nn.Module):
+    def __init__(self, channel):
+        super(CALayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.ca = nn.Sequential(
+            nn.Conv2d(channel, channel // 8, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // 8, channel, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.ca(y)
+        return x * y
+
+
+class DehazeBlock(nn.Module):
+    def __init__(self, conv, dim, kernel_size):
+        super(DehazeBlock, self).__init__()
+        self.conv1 = conv(dim, dim, kernel_size, bias=True)
+        self.act1 = nn.ReLU(inplace=True)
+        self.conv2 = conv(dim, dim, kernel_size, bias=True)
+        self.calayer = CALayer(dim)
+        self.palayer = PALayer(dim)
+
+    def forward(self, x):
+        res = self.act1(self.conv1(x))
+        res = res + x
+        res = self.conv2(res)
+        res = self.calayer(res)
+        res = self.palayer(res)
+        res += x
+        return res
+
+class DCNBlock(nn.Module):
+    def __init__(self, in_channel, out_channel):
+        super(DCNBlock, self).__init__()
+        self.dcn = DCN(in_channel, out_channel, kernel_size=(3,3), stride=1, padding=1).cuda()
+    def forward(self, x):
+        return self.dcn(x)
+
+class Mix(nn.Module):
+    def __init__(self, m=-0.80):
+        super(Mix, self).__init__()
+        w = torch.nn.Parameter(torch.FloatTensor([m]), requires_grad=True)
+        w = torch.nn.Parameter(w, requires_grad=True)
+        self.w = w
+        self.mix_block = nn.Sigmoid()
+
+    def forward(self, fea1, fea2):
+        mix_factor = self.mix_block(self.w)
+        out = fea1 * mix_factor.expand_as(fea1) + fea2 * (1 - mix_factor.expand_as(fea2))
+        return out
+
+class Dehaze(nn.Module):
+    def __init__(self, input_nc,  output_nc, use_dropout=False, padding_type='reflect'):
+        super(Dehaze, self).__init__()
+
+        ###### downsample
+        # self.down1 = nn.Sequential(nn.Conv2d(input_nc, 64, kernel_size=11, stride=4, padding=2),#55
+        #                            nn.BatchNorm2d(64),
+        #                            nn.ReLU(True))
+        self.down1 = nn.Sequential(nn.Conv2d(input_nc, 64, kernel_size=8, stride=2, padding=1),
+                                   nn.BatchNorm2d(64),
+                                   nn.ReLU(True))
+        self.down2 = nn.Sequential(nn.Conv2d(64, 64, kernel_size=4, stride=2, padding=1),
+                                   nn.BatchNorm2d(64),
+                                   nn.ReLU(True))
+
+
+        self.down3 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),#28
+                                   nn.BatchNorm2d(128),
+                                   nn.ReLU(True))
+        self.down4 = nn.Sequential(nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=3),#16
+                                   nn.BatchNorm2d(256),
+                                   nn.ReLU(True))
+        self.down5 = nn.Sequential(nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),#8
+                                   nn.BatchNorm2d(512),
+                                   nn.ReLU(True))
+
+
+        ###### FFA blocks
+        self.block = DehazeBlock(default_conv, 512, 3)
+
+        ###### upsample
+        self.up1 = nn.Sequential(nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2, padding=1, output_padding=1),#16
+                                 nn.BatchNorm2d(256),
+                                 nn.ReLU(True))
+        self.up2 = nn.Sequential(nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=3),#28
+                                 nn.BatchNorm2d(128),
+                                 nn.ReLU(True))
+        self.up3 = nn.Sequential(nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1),#55
+                                 nn.BatchNorm2d(64),
+                                 nn.ReLU(True))
+        self.up4 = nn.Sequential(nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # 55
+                                 nn.BatchNorm2d(64),
+                                 nn.ReLU(True))
+
+        self.up5 = nn.Sequential(nn.ConvTranspose2d(64, output_nc, kernel_size=8, stride=2, padding=1),
+                                 nn.BatchNorm2d(output_nc),
+                                 nn.ReLU(True))
+        self.up6 = nn.Sequential(nn.ConvTranspose2d(6, 3, kernel_size=5, stride=1, padding=2, bias=False))
+
+        self.deconv = FastDeconv(3, 3, kernel_size=3, stride=1, padding=1)
+        self.dcn_block = DCNBlock(512, 512)
+
+        self.mix1 = Mix(m=-1)
+        self.mix2 = Mix(m=-0.8)
+        self.mix3 = Mix(m=-0.7)
+        self.mix4 = Mix(m=-0.6)
+
+    def forward(self, input):
+        x_deconv = self.deconv(input)
+        x_down1 = self.down1(x_deconv) # [bs, 64, 28, 28]
+        x_down2 = self.down2(x_down1) # [bs, 64, 16, 16]
+        x_down3 = self.down3(x_down2) # [bs, 128, 8, 8]
+        x_down4 = self.down4(x_down3)
+        x_down5 = self.down5(x_down4)
+
+        x1 = self.block(x_down5)
+        x2 = self.block(x1)
+        x3 = self.block(x2)
+        x4 = self.block(x3)
+        x5 = self.block(x4)
+        x6 = self.block(x5)
+
+        x_dcn1 = self.dcn_block(x6)
+        x_dcn2 = self.dcn_block(x_dcn1)
+
+        x_out_mix = self.mix1(x_down5, x_dcn2)
+        x_up1 = self.up1(x_out_mix) # [bs, 128, 128, 128]
+
+        x_up1_mix = self.mix2(x_down4, x_up1)
+        x_up2 = self.up2(x_up1_mix) # [bs, 64, 256, 256]
+
+        x_up2_mix = self.mix3(x_down3, x_up2)
+        x_up3 = self.up3(x_up2_mix)
+
+        x_up3_mix = self.mix4(x_down2, x_up3)
+        x_up4 = self.up4(x_up3_mix)
+
+        out = self.up5(x_up4) # [bs,  3, 256, 256]
+        final_out = self.up6(out)
+        final_out = torch.sigmoid(final_out)
+        out = torch.sigmoid(out)
+
+        return out, final_out
